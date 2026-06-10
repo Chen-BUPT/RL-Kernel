@@ -15,6 +15,18 @@ def _next_pow2(x: int) -> int:
     return 1 if x <= 1 else 1 << (x - 1).bit_length()
 
 
+_MAX_GROUP_SIZE = 1024
+
+
+def _check_group_block_limit(max_group: int) -> None:
+    if max_group > _MAX_GROUP_SIZE:
+        raise ValueError(
+            f"max group size {max_group} exceeds the Triton GRPO kernel limit of "
+            f"{_MAX_GROUP_SIZE}. Reduce samples_per_prompt / group sizes, or use a "
+            "tiled reduction kernel for larger groups."
+        )
+
+
 @triton.jit
 def _group_norm_kernel(
     rewards_ptr,
@@ -50,7 +62,7 @@ def _grpo_fwd_kernel(
     ref_ptr,
     adv_seq_ptr,  # float32[B], per-sequence advantages
     mask_ptr,
-    partials_ptr,  # float32[2]: (policy_sum, kl_sum)
+    partials_ptr,  # float32[grid, 2]: per-block (policy_sum, kl_sum)
     n_elements,
     T,  # completion length (tokens per sequence)
     clip_eps,
@@ -81,8 +93,8 @@ def _grpo_fwd_kernel(
     policy_term = tl.where(keep, policy_term, 0.0)
     kl_term = tl.where(keep, kl_term, 0.0)
 
-    tl.atomic_add(partials_ptr + 0, tl.sum(policy_term, axis=0))
-    tl.atomic_add(partials_ptr + 1, tl.sum(kl_term, axis=0))
+    tl.store(partials_ptr + pid * 2 + 0, tl.sum(policy_term, axis=0))
+    tl.store(partials_ptr + pid * 2 + 1, tl.sum(kl_term, axis=0))
 
 
 @triton.jit
@@ -149,9 +161,9 @@ class _GRPOLossFunction(torch.autograd.Function):
 
         n = cur.numel()
         num_active = mask_f.sum().clamp_min(1e-8)
-        partials = torch.zeros(2, device=cur.device, dtype=torch.float32)
 
         grid = (triton.cdiv(n, _BLOCK),)
+        partials = torch.empty(grid[0], 2, device=cur.device, dtype=torch.float32)
         _grpo_fwd_kernel[grid](
             cur.reshape(-1),
             old.reshape(-1),
@@ -165,8 +177,9 @@ class _GRPOLossFunction(torch.autograd.Function):
             BLOCK=_BLOCK,
         )
 
-        policy_loss = partials[0] / num_active
-        kl = partials[1] / num_active
+        block_sums = partials.sum(dim=0)
+        policy_loss = block_sums[0] / num_active
+        kl = block_sums[1] / num_active
         loss = policy_loss + beta * kl
 
         ctx.save_for_backward(cur, old, ref, adv, mask_f)
@@ -260,6 +273,7 @@ class TritonGRPOLossOp:
                     f"num_sequences ({num_sequences}) must be divisible by "
                     f"samples_per_prompt ({samples_per_prompt})."
                 )
+            _check_group_block_limit(samples_per_prompt)
             bounds = torch.arange(
                 0, num_sequences + 1, samples_per_prompt, device=device, dtype=torch.int32
             )
@@ -273,7 +287,9 @@ class TritonGRPOLossOp:
             raise ValueError("group_boundaries must start at 0 and end at num_sequences.")
         if bool((sizes < 1).any().item()):
             raise ValueError("each group must contain at least one sequence.")
-        return bounds, int(sizes.max().item())
+        max_group = int(sizes.max().item())
+        _check_group_block_limit(max_group)
+        return bounds, max_group
 
     def group_advantages(
         self,
@@ -291,6 +307,9 @@ class TritonGRPOLossOp:
         bounds, max_group = self._build_bounds(n, flat.device, samples_per_prompt, group_boundaries)
         num_groups = bounds.numel() - 1
         adv = torch.empty(n, device=flat.device, dtype=torch.float32)
+
+        # TODO: for larger groups, implement a tiled reduction version of the
+        # kernel that can handle >1024 sequences per group.
         _group_norm_kernel[(num_groups,)](
             flat,
             bounds,

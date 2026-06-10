@@ -70,7 +70,7 @@ class NativeGRPOLossOp:
 
         means = sums / counts
         variance = (sq_sums / counts) - means * means
-        stds = variance.clamp_min(0.0).sqrt().clamp_min(eps)
+        stds = variance.clamp_min(eps**2).sqrt()
 
         return (flat_rewards - means[group_id]) / stds[group_id]
 
