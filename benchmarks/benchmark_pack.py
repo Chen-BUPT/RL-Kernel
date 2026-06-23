@@ -33,7 +33,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from rl_engine.kernels.ops.pytorch.packing.pack import NativePackOp  # noqa: E402
 from rl_engine.testing import make_synthetic_rl_kernel_batch  # noqa: E402
 
 CSV_COLUMNS = [
@@ -46,6 +45,7 @@ CSV_COLUMNS = [
     "samples_per_prompt",
     "completion_len",
     "vocab_size",
+    "hidden_dim",
     "mask_density",
     "valid_tokens",
     "baseline_ms",
@@ -69,6 +69,7 @@ class BenchmarkConfig:
     samples_per_prompt: int
     completion_len: int
     vocab_size: int
+    hidden_dim: int
     mask_density: float
     seed: int
     warmup: int
@@ -144,9 +145,16 @@ def _baseline_pack(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 
 def _selected_logp(logits: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
-    """log_softmax(logits)[ids] over the last dim; ids shape == logits.shape[:-1]."""
-    logp = torch.log_softmax(logits.float(), dim=-1)
-    return logp.gather(-1, ids.long().unsqueeze(-1)).squeeze(-1)
+    """selected log-prob = logits[ids] - logsumexp(logits) over the last dim.
+
+    Computed without materializing a full [*, V] log_softmax tensor and without
+    upcasting the whole logits tensor to fp32, so the dense path's peak memory
+    is dominated by the input logits themselves -- which is exactly the cost
+    that packing removes for masked-out tokens (issue #42).
+    """
+    selected = logits.gather(-1, ids.long().unsqueeze(-1)).squeeze(-1)
+    lse = torch.logsumexp(logits, dim=-1)
+    return selected - lse
 
 
 def _pack_row(config: BenchmarkConfig) -> dict[str, Any]:
@@ -164,12 +172,20 @@ def _pack_row(config: BenchmarkConfig) -> dict[str, Any]:
         seed=config.seed,
     )
 
-    logit_shape = (batch.batch_size, batch.completion_len, config.vocab_size)
-    logits = torch.randn(logit_shape, device=config.device, dtype=config.dtype)
+    # Real RL chain: hidden -> (lm_head) -> logits -> selected logp.
+    # Packing hidden *before* the vocab projection means the full [B, S, V]
+    # logits are never materialized for masked-out tokens (issue #42).
+    hidden_dim = config.hidden_dim
+    hidden = torch.randn(
+        (batch.batch_size, batch.completion_len, hidden_dim),
+        device=config.device,
+        dtype=config.dtype,
+    )
+    lm_head = torch.randn(
+        (hidden_dim, config.vocab_size), device=config.device, dtype=config.dtype
+    )
     mask = batch.completion_mask
     ids = batch.token_ids
-
-    native_pack = NativePackOp()
 
     status = "pass"
     notes = ""
@@ -181,10 +197,11 @@ def _pack_row(config: BenchmarkConfig) -> dict[str, Any]:
     packed_logp_mem_gb: float | str = ""
     mem_saving_pct: float | str = ""
 
-    # (1) pack latency: PyTorch boolean-index baseline vs Triton candidate.
+    # (1) pack latency: PyTorch boolean-index baseline vs Triton candidate
+    # (packing the hidden states, the [*, D] tensor moved in the real chain).
     _reset_peak(config.device)
     base_packed, baseline_ms = _time_ms(
-        lambda: _baseline_pack(logits, mask),
+        lambda: _baseline_pack(hidden, mask),
         config.device,
         warmup=config.warmup,
         repeat=config.repeat,
@@ -202,7 +219,7 @@ def _pack_row(config: BenchmarkConfig) -> dict[str, Any]:
                 raise RuntimeError(f"{candidate_name} backend is unavailable")
 
             (cand_packed, _), candidate_ms = _time_ms(
-                lambda: candidate_op(logits, mask),
+                lambda: candidate_op(hidden, mask),
                 config.device,
                 warmup=config.warmup,
                 repeat=config.repeat,
@@ -210,16 +227,21 @@ def _pack_row(config: BenchmarkConfig) -> dict[str, Any]:
             speedup = baseline_ms / candidate_ms if candidate_ms else float("inf")
             pack_drift = (cand_packed.float() - base_packed.float()).abs().max().item()
 
-            # (2) end-to-end peak VRAM: dense logp vs pack->logp.
+            # (2) end-to-end peak VRAM: dense (full logits) vs pack-then-project.
+            flat_ids = ids.reshape(-1)
             _reset_peak(config.device)
-            _ = _selected_logp(logits, ids)
+            dense_logits = (hidden.reshape(-1, hidden_dim) @ lm_head)
+            _ = _selected_logp(dense_logits, flat_ids)
+            del dense_logits
             _sync(config.device)
             dense_logp_mem_gb = _peak_memory_gb(config.device)
 
             _reset_peak(config.device)
-            packed_logits, _ = candidate_op(logits, mask)
+            packed_hidden, _ = candidate_op(hidden, mask)
             packed_ids, _ = candidate_op(ids.unsqueeze(-1), mask)
+            packed_logits = packed_hidden @ lm_head
             _ = _selected_logp(packed_logits, packed_ids.squeeze(-1))
+            del packed_logits, packed_hidden
             _sync(config.device)
             packed_logp_mem_gb = _peak_memory_gb(config.device)
 
@@ -247,6 +269,7 @@ def _pack_row(config: BenchmarkConfig) -> dict[str, Any]:
         "samples_per_prompt": config.samples_per_prompt,
         "completion_len": config.completion_len,
         "vocab_size": config.vocab_size,
+        "hidden_dim": config.hidden_dim,
         "mask_density": config.mask_density,
         "valid_tokens": metadata["valid_tokens"],
         "baseline_ms": f"{baseline_ms:.4f}" if isinstance(baseline_ms, float) else baseline_ms,
@@ -287,6 +310,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--g-sizes", default="8", help="Comma-separated samples-per-prompt values")
     parser.add_argument("--completion-lens", default="1024")
     parser.add_argument("--vocab-sizes", default="32768,131072")
+    parser.add_argument("--hidden-dim", type=int, default=4096)
     parser.add_argument(
         "--mask-densities",
         default="0.1,0.3,1.0",
@@ -310,12 +334,14 @@ def main() -> None:
         completion_lens = [8]
         vocab_sizes = [128]
         mask_densities = [0.5, 1.0]
+        hidden_dim = 64
     else:
         num_prompts = args.num_prompts
         g_sizes = _parse_int_list(args.g_sizes)
         completion_lens = _parse_int_list(args.completion_lens)
         vocab_sizes = _parse_int_list(args.vocab_sizes)
         mask_densities = _parse_float_list(args.mask_densities)
+        hidden_dim = args.hidden_dim
 
     rows: list[dict[str, Any]] = []
     for samples_per_prompt in g_sizes:
@@ -330,6 +356,7 @@ def main() -> None:
                         samples_per_prompt=samples_per_prompt,
                         completion_len=completion_len,
                         vocab_size=vocab_size,
+                        hidden_dim=hidden_dim,
                         mask_density=mask_density,
                         seed=args.seed,
                         warmup=args.warmup,
@@ -349,6 +376,7 @@ def main() -> None:
                                 "samples_per_prompt": samples_per_prompt,
                                 "completion_len": completion_len,
                                 "vocab_size": vocab_size,
+                                "hidden_dim": hidden_dim,
                                 "mask_density": mask_density,
                                 "valid_tokens": "",
                                 "baseline_ms": "",
