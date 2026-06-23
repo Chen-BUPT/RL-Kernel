@@ -32,8 +32,6 @@ def _validate(x: torch.Tensor, mask: torch.Tensor) -> None:
             f"mask shape {tuple(mask.shape)} must match the leading dims of "
             f"x.shape {tuple(x.shape)} (expected {tuple(x.shape[: mask.dim()])})."
         )
-    if mask.dim() < 1:
-        raise ValueError("mask must have at least one dimension.")
 
 
 class _PackFunction(torch.autograd.Function):
