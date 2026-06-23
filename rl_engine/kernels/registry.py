@@ -50,6 +50,7 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     PYTORCH_RATIO_KL = "rl_engine.kernels.ops.pytorch.loss.ratio_kl.NativeRatioKLOp"
 
     # Fused masking + variable-length packing (pack-and-pad), [B,S,...] -> [Total_Active,...]
+    CUDA_PACK = "rl_engine.kernels.ops.cuda.packing.pack.CudaPackOp"
     TRITON_PACK = "rl_engine.kernels.ops.triton.packing.pack.TritonPackOp"
     PYTORCH_PACK = "rl_engine.kernels.ops.pytorch.packing.pack.NativePackOp"
 
@@ -94,7 +95,7 @@ class KernelRegistry:
                 "linear_logp": [OpBackend.TRITON_LINEAR_LOGP, OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
                 # Default dispatch logic for new operators
-                "pack": [OpBackend.TRITON_PACK, OpBackend.PYTORCH_PACK],
+                "pack": [OpBackend.CUDA_PACK, OpBackend.TRITON_PACK, OpBackend.PYTORCH_PACK],
             },
             "rocm": {
                 "logp": [OpBackend.ROCM_AITER, OpBackend.TRITON_GENERIC, OpBackend.PYTORCH_NATIVE],

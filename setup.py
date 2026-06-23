@@ -57,6 +57,7 @@ def get_extensions():
         cuda_sources = [
             "csrc/ops.cpp",
             "csrc/fused_logp_kernel.cu",
+            "csrc/pack_kernel.cu",
             "csrc/cuda/attention/prefix_shared_attention.cu",
         ]
 

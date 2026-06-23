@@ -7,6 +7,14 @@
 // Fused LogP Declarations
 torch::Tensor fused_logp_forward(torch::Tensor logits, torch::Tensor token_ids);
 
+// Pack-and-pad Declarations (issue #42)
+std::vector<torch::Tensor> pack_forward(torch::Tensor src,
+                                        torch::Tensor src_row,
+                                        torch::Tensor cu_seqlens);
+torch::Tensor pack_backward(torch::Tensor grad_packed,
+                            torch::Tensor src_row,
+                            int64_t n_rows);
+
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_SM90)
 torch::Tensor fused_logp_sm90_forward(torch::Tensor logits, torch::Tensor labels);
 std::vector<torch::Tensor> fused_linear_logp_sm90_forward(torch::Tensor hidden,
@@ -95,5 +103,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     // registry Prefix-Shared Attention
     m.def("prefix_shared_attention", &prefix_shared_attention, "Prefix-Shared Fused Attention for GRPO");
+
+    // Pack-and-pad (issue #42)
+    m.def("pack_forward", &pack_forward,
+          "Fused masking + variable-length packing: gather active rows -> [n_active, T]");
+    m.def("pack_backward", &pack_backward,
+          "Pack-and-pad backward: scatter packed grad back to [n_rows, T]");
 #endif
 }

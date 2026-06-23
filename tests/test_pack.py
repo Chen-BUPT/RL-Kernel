@@ -25,9 +25,21 @@ try:
 except ImportError:  # pragma: no cover
     _HAS_TRITON = False
 
+try:
+    from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
+
+    _HAS_CUDA_PACK = _EXT_AVAILABLE and hasattr(_C, "pack_forward")
+except Exception:  # pragma: no cover
+    _HAS_CUDA_PACK = False
+
 requires_triton_cuda = pytest.mark.skipif(
     not (_HAS_TRITON and torch.cuda.is_available()),
     reason="Triton pack op requires a CUDA device and Triton.",
+)
+
+requires_cuda_pack = pytest.mark.skipif(
+    not (_HAS_CUDA_PACK and torch.cuda.is_available()),
+    reason="Native CUDA pack op requires a compiled _C extension and a CUDA device.",
 )
 
 _NUM_PROMPTS = 3
@@ -187,7 +199,11 @@ def test_registry_dispatches_pack():
     from rl_engine.kernels.registry import kernel_registry
 
     op = kernel_registry.get_op("pack")
-    if _HAS_TRITON and torch.cuda.is_available():
+    if _HAS_CUDA_PACK and torch.cuda.is_available():
+        from rl_engine.kernels.ops.cuda.packing.pack import CudaPackOp
+
+        assert isinstance(op, CudaPackOp)
+    elif _HAS_TRITON and torch.cuda.is_available():
         assert isinstance(op, TritonPackOp)
     else:
         assert isinstance(op, NativePackOp)
@@ -251,6 +267,64 @@ def test_triton_inactive_rows_do_not_leak():
 @requires_triton_cuda
 def test_triton_requires_gpu_tensor():
     op = TritonPackOp()
+    x = torch.randn(2, 3, 4)
+    mask = torch.ones(2, 3, dtype=torch.bool)
+    with pytest.raises(RuntimeError):
+        op(x, mask)
+
+
+# Native CUDA fused op (validated against the native reference)
+@requires_cuda_pack
+@pytest.mark.parametrize("valid_density", [1.0, 0.7, 0.0])
+def test_cuda_forward_matches_native(valid_density):
+    from rl_engine.kernels.ops.cuda.packing.pack import CudaPackOp
+
+    batch = _batch(seed=20, device="cuda", valid_density=valid_density)
+    x = _dense(batch, seed=120, device="cuda")
+    packed_c, cu_c = CudaPackOp()(x, batch.completion_mask)
+    packed_n, cu_n = NativePackOp()(x, batch.completion_mask)
+    assert torch.equal(packed_c, packed_n)
+    assert torch.equal(cu_c, cu_n)
+
+
+@requires_cuda_pack
+def test_cuda_backward_matches_native():
+    from rl_engine.kernels.ops.cuda.packing.pack import CudaPackOp
+
+    batch = _batch(seed=21, device="cuda", valid_density=0.7)
+    x0 = _dense(batch, seed=121, device="cuda")
+    g = torch.randn(int(batch.completion_mask.sum()), _VOCAB, device="cuda")
+
+    xc = x0.clone().requires_grad_(True)
+    pc, _ = CudaPackOp()(xc, batch.completion_mask)
+    pc.backward(g)
+
+    xn = x0.clone().requires_grad_(True)
+    pn, _ = NativePackOp()(xn, batch.completion_mask)
+    pn.backward(g)
+
+    assert xc.grad is not None
+    assert torch.equal(xc.grad, xn.grad)
+
+
+@requires_cuda_pack
+def test_cuda_supports_multidim_tail():
+    from rl_engine.kernels.ops.cuda.packing.pack import CudaPackOp
+
+    mask = torch.tensor([[True, False, True], [False, True, True]], device="cuda")
+    x = torch.randn(2, 3, 4, 5, device="cuda")
+    packed_c, cu_c = CudaPackOp()(x, mask)
+    packed_n, cu_n = NativePackOp()(x, mask)
+    assert packed_c.shape == (4, 4, 5)
+    assert torch.equal(packed_c, packed_n)
+    assert cu_c.tolist() == [0, 2, 4]
+
+
+@requires_cuda_pack
+def test_cuda_requires_gpu_tensor():
+    from rl_engine.kernels.ops.cuda.packing.pack import CudaPackOp
+
+    op = CudaPackOp()
     x = torch.randn(2, 3, 4)
     mask = torch.ones(2, 3, dtype=torch.bool)
     with pytest.raises(RuntimeError):
