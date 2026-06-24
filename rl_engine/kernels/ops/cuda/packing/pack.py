@@ -35,7 +35,9 @@ def _dest_and_cu_seqlens(mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor
     flat = mask.reshape(-1).to(torch.bool)
     src_row = flat.nonzero(as_tuple=False).squeeze(-1).to(torch.int64).contiguous()
 
-    per_row_active = mask.reshape(mask.shape[0], -1).to(torch.int64).sum(dim=1)
+    # Count from the bool mask so a non-bool mask (nonzero == active) keeps
+    # cu_seqlens consistent with the number of rows actually packed.
+    per_row_active = flat.reshape(mask.shape[0], -1).to(torch.int64).sum(dim=1)
     cu_seqlens = torch.zeros(mask.shape[0] + 1, dtype=torch.int64, device=mask.device)
     torch.cumsum(per_row_active, dim=0, out=cu_seqlens[1:])
     return src_row, cu_seqlens
