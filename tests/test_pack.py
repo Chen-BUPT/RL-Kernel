@@ -94,6 +94,23 @@ def test_cu_seqlens_is_per_row_prefix_sum():
     assert torch.equal(cu_seqlens, expected)
 
 
+def test_non_bool_mask_cu_seqlens_matches_packed_rows():
+    """A non-bool mask (nonzero == active) must not over-count cu_seqlens.
+
+    Counting active rows from the raw integer mask (e.g. values in {0, 2})
+    would inflate cu_seqlens beyond the number of rows actually packed.
+    """
+    op = NativePackOp()
+    mask = torch.tensor([[0, 2, 0], [2, 2, 0]], dtype=torch.int32)
+    x = torch.randn(2, 3, 4)
+
+    packed, cu_seqlens = op(x, mask)
+    # 3 nonzero positions -> 3 packed rows; cu_seqlens must end at 3, not 6.
+    assert packed.shape[0] == 3
+    assert cu_seqlens.tolist() == [0, 1, 3]
+    assert torch.equal(packed, x.reshape(-1, 4)[mask.reshape(-1).to(torch.bool)])
+
+
 def test_pack_all_active_is_identity_flatten():
     batch = _batch(seed=3, valid_density=1.0)
     x = _dense(batch, seed=103)

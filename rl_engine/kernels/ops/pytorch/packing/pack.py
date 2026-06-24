@@ -50,7 +50,10 @@ class _PackFunction(torch.autograd.Function):
         packed = flat_x.index_select(0, index)
 
         # cu_seqlens: prefix-sum of per-row active counts, for varlen consumers.
-        per_row_active = mask.reshape(mask.shape[0], -1).to(torch.int64).sum(dim=1)
+        # Count from the bool mask so a non-bool mask (e.g. {0, 2}) matches the
+        # number of rows actually packed above (nonzero == active).
+        bool_mask = flat_mask.reshape(mask.shape[0], -1)
+        per_row_active = bool_mask.to(torch.int64).sum(dim=1)
         cu_seqlens = torch.zeros(mask.shape[0] + 1, dtype=torch.int64, device=x.device)
         torch.cumsum(per_row_active, dim=0, out=cu_seqlens[1:])
 
